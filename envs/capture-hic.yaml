@@ -1,0 +1,17 @@
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+
+dependencies:
+  - 'r-base>=4.1'
+  - bioconductor-interactionset
+  - r-data.table
+  - r-ggplot2
+  - r-rmarkdown
+  - r-pals
+  - r-proc
+  - r-upsetr
+  - r-scales
+  - r-forcats
+

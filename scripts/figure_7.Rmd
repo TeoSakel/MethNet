@@ -1,0 +1,394 @@
+---
+title: "Perturb-seq Analyis"
+output: html_document
+params:
+  rmd: figure_7.Rmd
+---
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(Matrix)
+library(data.table)
+library(ggplot2)
+library(ggsignif)
+library(SingleCellExperiment)
+library(DropletUtils)
+library(scater)
+library(scran)
+library(BiocParallel)
+library(parallel)
+library(limma)
+
+theme_set(theme_classic())
+Ncores <- future::availableCores()
+BPPARAM <- MulticoreParam(Ncores, stop.on.error = FALSE)
+```
+
+```{r params}
+Nboot <- snakemake@params[["Nboot"]]
+low_expr <- 2e-4
+max_mito_pct <- 10
+min_detected <- 2000
+min_hto <- 1000
+```
+
+```{r}
+methnet <- fread(snakemake@input[["methnet"]])
+net <- fread(snakemake@input[["net"]])
+umis <- fread(snakemake@input[["umi_thres"]])
+sce <- read10xCounts(snakemake@input[["h5file"]])
+rowData(sce)$Type <- factor(rowData(sce)$Type,  c("Gene Expression", "Antibody Capture", "CRISPR Guide Capture"), c("GeneExpr", "Antibody", "CRISPR"))
+sce <- splitAltExps(sce, rowData(sce)$Type)
+colData(sce)$Sample <- "A549"
+```
+
+## QC
+
+```{r cell_qc}
+stats <- perCellQCMetrics(sce, subsets = list(Mito = grep("^MT-", rowData(sce)$Symbol)), BPPARAM = BPPARAM)
+colData(sce) <- cbind(colData(sce), stats)
+stats <- as.data.table(colData(sce))
+```
+
+```{r cell_qc_figs}
+ggplot(stats, aes(detected, sum/detected)) +
+    geom_point(aes(color = subsets_Mito_percent), size = .1) +
+    geom_vline(xintercept = min_detected, color = "red", linetype = "dashed") +
+    scale_color_viridis_c() +
+    # scale_x_log10() +
+    labs(x = "Detected Genes", y = "Mean Expression")
+
+ggplot(stats, aes(detected, subsets_Mito_percent)) +
+    geom_point(size = .1) +
+    geom_density_2d() +
+    geom_hline(yintercept = max_mito_pct, color = "red", linetype = "dashed") +
+    geom_vline(xintercept = min_detected, color = "red", linetype = "dashed") +
+    scale_x_log10() +
+    labs(x = "Detected Genes", y = "% of Mito Genes")
+```
+
+
+```{r cell_filter}
+sce <- sce[, sce$subsets_Mito_percent < max_mito_pct & sce$detected > min_detected]
+stats <- as.data.table(colData(sce))
+```
+
+```{r hto_filter}
+HTO <- altExp(sce, "Antibody")
+x <- rowSums(counts(HTO))
+HTO <- HTO[x > min_hto, ]
+barplot(log10(x + 1), main = "Antibody Counts", xlab = "Antibody", ylab = "log10(Counts)")
+abline(h = log10(min_hto), col = "red", lty = 2L)
+```
+
+```{r hto_lfc}
+altExp(sce, "Antibody") <- HTO
+x <- colMaxs(counts(HTO)) / colSums(counts(HTO))
+stats$logFC <- log2(x) - log2(1-x)
+ggplot(stats, aes(detected, sum/detected)) +
+    geom_point(aes(color = pmin(logFC, 2)), size = .1) +
+    scale_color_gradient2() +
+    # scale_x_log10() +
+    labs(x = "Detected Genes", y = "Mean Expression")
+```
+
+```{r hto}
+HTO <- hashedDrops(HTO)
+```
+
+```{r hto_thres_fig}
+stats <- as.data.table(HTO)
+stats[, `:=`(Detected = sce$detected, Sum = sce$sum)]
+stats[, Mean := Sum / Detected]
+
+ggplot(stats, aes(Detected, Mean)) +
+    geom_point(aes(color = pmin(LogFC2, 2)), size = .1) +
+    scale_color_viridis_c() +
+    labs(x = "Detected Genes", y = "Mean Expression", color = "2 vs Rest")
+
+ggplot(stats, aes(LogFC, LogFC2)) +
+    geom_point(aes(color = Total), size = .1) +
+    geom_hline(yintercept = 2, color = "red") +
+    scale_color_viridis_c(trans = "log10")
+
+```
+
+```{r hto_heatmap}
+ix <- stats[, which(LogFC < 1 & LogFC2 < 2 & Total > 100)]
+x <- counts(altExp(sce)[,ix])
+colnames(x) <- sce$Barcode[ix]
+df <- stats[ix, .(Total, LogFC, LogFC2)]
+rownames(df) <- colnames(x)
+x <- sweep(as.matrix(x), 2, colSums(x), "/")
+pheatmap::pheatmap(x, breaks = seq(0, .6, length = 100), color = pals::viridis(101), cluster_rows = FALSE,
+                   # clustering_distance_cols = "correlation",
+                   show_colnames = FALSE,
+                   annotation_col = df)
+```
+
+```{r hto_qc_fig2}
+ggplot(stats, aes(LogFC, LogFC2)) +
+    geom_point(aes(color = Total), size = .1) +
+    geom_hline(yintercept = 2, color = "red") +
+    annotate("rect", xmin = 0, xmax = 1, ymin = 0, ymax = 2, fill = "red", alpha = .5) +
+    scale_color_viridis_c(trans = "log10")
+```
+
+```{r filter_doublets}
+ix <- union(ix, which(stats$Doublet))
+sce <- sce[, -ix]
+```
+
+```{r final_qc}
+stats <- as.data.frame(colData(sce))
+ggplot(stats, aes(detected, sum/detected)) +
+    geom_point(alpha = .5, size = .1) +
+    geom_density_2d() +
+    labs(x = "Detected Genes", y = "Mean Expression", color = "2 vs Rest")
+```
+
+```{r crispr}
+crispr <- altExp(sce, "CRISPR")
+setkey(umis, Protospacer)
+rowData(crispr)$Threshold <- umis[rownames(crispr), `UMI threshold`]
+rowData(crispr)$Symbol <- NULL
+rowData(crispr)$Target <- sub("_(Human_CRi_B)?\\d+$", "", rowData(crispr)$ID)
+rowData(crispr)$Detected <- rowSums(counts(crispr) > rowData(crispr)$Threshold)
+assay(crispr, "detected") <- counts(crispr) / rowData(crispr)$Threshold
+crispr$sum <- colSums(counts(crispr))
+crispr$detected <- colSums(counts(crispr) >= rowData(crispr)$Threshold)
+```
+
+```{r guide_qc_fig}
+DT <- data.table(detected = colSums(assay(crispr, "detected") > 1),
+                 genes = sce$detected,
+                 total = sce$sum)
+# DT$total = sce$detected
+ggplot(DT, aes(genes, total * 1e-3)) +
+    geom_point(aes(color = detected), alpha = .25, size = .5) +
+    scale_color_viridis_c() +
+    scale_x_log10() +
+    labs(x = "Expressed Genes", y = "Number of Reads (x1000)",
+         title = "Perturb-seq Cell QC Metrics", color = "CRISPR\nGuides") +
+    theme_classic(base_size = 14)
+```
+
+```{r figure_s9d}
+Nmax <- 11L
+DT <- data.table(detected = crispr$detected, total = crispr$sum)[, .N, .(Nguides = pmin(detected, Nmax))]
+DT[, Freq := N / sum(N)]
+DT[, Nguides := factor(Nguides, 0:Nmax, c(1:Nmax - 1L, sprintf("> %d", Nmax - 1L)))]
+ggplot(DT, aes(Nguides, N)) +
+    geom_col(aes(fill = Nguides), color = "black", show.legend = FALSE) +
+    scale_fill_manual(values = pals::brewer.reds(Nmax + 1)) +
+    scale_y_continuous(expand = expansion(c(0, .1))) +
+    labs(x = "Number of Guides", y = "Number of Cells", title = "Histogram of Guides per Cell") +
+    theme_classic(base_size = 14) +
+    theme(plot.title = element_text(hjust = .5))
+```
+
+## Main
+
+Keep only genes that MethNet could potentially identify (within 1Mb) of a target.
+
+
+```{r}
+methnet[, cluster := sub(":", "-", cluster)]
+methnet <- methnet[cluster %in% rowData(crispr)$Target]
+```
+
+```{r}
+net[, cluster := sub(":", "-", cluster)]
+net <- net[cluster %in% rowData(crispr)$Target]
+sce_meth <- sce[rowData(sce)$Symbol %in% net$gene,]
+sce_meth <- logNormCounts(sce_meth)
+```
+
+```{r}
+X <- (assay(crispr, "detected") > 1) + 0L
+X <- t(X)
+X <- as(X, "dgCMatrix")
+X <- X[, -grep("Non_Targeting_Human", colnames(X))]
+Y <- as(logcounts(sce_meth), "dgCMatrix")
+rownames(Y) <- rowData(sce_meth)$Symbol
+```
+
+```{r}
+DT <- data.table(M = rowMeans(Y), V = rowSds(Y), D = rowMeans(Y > 0))
+ggplot(DT, aes(M, V)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+    geom_point(aes(color = D), size = .2) +
+    geom_vline(xintercept = low_expr, color = "red") +
+    scale_color_viridis_c() +
+    scale_x_log10() + scale_y_log10() +
+    labs(x = "Mean Expresion", y = "Standard Deviations", color = "Detected")
+```
+
+```{r}
+Y <- Y[rowMeans(Y) > low_expr,]
+X <- cbind(rep(1L, nrow(X)), X)
+colnames(X)[1] <- "Intercept"
+fit <- lmFit(Y, X)
+fit <- eBayes(fit)
+```
+
+```{r}
+top_hits <- lapply(2:ncol(X), function(k) topTable(fit, coef = k, n = Inf)) |>
+    lapply(as.data.table) |>
+    setNames(colnames(X)[2:ncol(X)]) |>
+    rbindlist(idcol = "sgRNA")
+setnames(top_hits, "ID", "Gene")
+top_hits[, `:=`(Target = sub("(_CRi)?_B?\\d+$", "", sgRNA),
+                Dir = fifelse(logFC > 0, "Up", "Down"))]
+top_hits[net, dist := i.dist_min, on = c("Target" = "cluster", "Gene" = "gene")]
+top_hits <- top_hits[!is.na(dist)]
+top_hits <- top_hits[, .SD[which.min(adj.P.Val)], .(sgRNA, Gene)]
+top_hits[, `:=`(coef = 0, contrib = 0)]
+top_hits[methnet, c("coef", "contrib") := .(i.coef, i.contrib), on = c("Target" = "cluster", "Gene" = "gene")]
+top_hits[, Dir := sign(logFC) * (adj.P.Val < 0.05)]
+```
+
+```{r}
+fwrite(top_hits, "data/results/perturb-seq_results.csv")
+```
+
+```{r figure_7b}
+top_hits[, Pool := coef != 0 | adj.P.Val < .05]
+top_hits[, Recovered := fifelse(coef != 0 & adj.P.Val < .05, "Predicted", "Ignored")]
+DT <- top_hits[Pool == TRUE, .SD[which.min(adj.P.Val)], Gene]
+DT <- DT[order(abs(logFC), decreasing = T)][1:10]
+# ggplot(top_hits[order(abs(coef))], aes(AveExpr, logFC)) +
+ggplot(top_hits[order(Recovered)], aes(AveExpr, logFC)) +
+    geom_point(aes(color = Recovered, shape = fifelse(adj.P.Val < .05, "< 0.05", "> 0.05"))) +
+    ggrepel::geom_text_repel(aes(label = Gene, color = Recovered),  data = DT, show.legend = F) +
+    scale_color_manual(values = c("Predicted" = "red3", "Missed" = "#00000050")) +
+    scale_shape_manual(values = c("< 0.05" = 16, "> 0.05" = 4)) +
+    guides(color = guide_legend(override.aes = list(size = 2)),
+           shape = guide_legend(override.aes = list(size = 2))) +
+    labs(x = "Mean Normalized Expression", y = "logFC", title = "Perturb-seq Interactions",
+         color = "MethNet", shape = "FDR") +
+    theme_classic(base_size = 14)
+```
+
+## Bootstrap Analysis
+
+```{r bootstrap}
+shuffle_X <- function(Nguides, X) {
+    Ncells <- nrow(X)
+    # Nguides <- colSums(X[, 2:ncol(X)])
+    Xp <- lapply(Nguides, function(x) sample(Ncells, x))
+    Xp <- data.table(i = unlist(Xp), j = rep(1:length(Xp), Nguides))
+    Xp <- Xp[, sparseMatrix(i = i, j = j, x = 1)]
+    Xp <- cbind(rep(1L, nrow(Xp)), Xp)
+    colnames(Xp) <- colnames(X)
+    Xp
+}
+
+count_concord <- function(i, Nguides, X, Y) {
+    Xp <- shuffle_X(Nguides, X)
+    fit2 <- tryCatch(lmFit(Y, Xp), error = function(e) NULL)
+    if (is.null(fit2)) return(NULL)
+    fit2 <- eBayes(fit2)
+    top_hits <- lapply(2:ncol(Xp), function(k) topTable(fit2, coef = k, n = Inf)) |>
+        lapply(as.data.table) |>
+        setNames(colnames(Xp)[2:ncol(Xp)]) |>
+        rbindlist(idcol = "sgRNA")
+    setnames(top_hits, "ID", "Gene")
+    top_hits[, `:=`(Target = sub("(_CRi)?_B?\\d+$", "", sgRNA),
+                    Dir = fifelse(logFC > 0, "Up", "Down"))]
+    top_hits[, `:=`(coef = 0, contrib = 0)]
+    top_hits[methnet, c("coef", "contrib") := .(i.coef, i.contrib),
+             on = c("Target" = "cluster", "Gene" = "gene")]
+    N <- top_hits[adj.P.Val < .05 & coef != 0, length(unique(Target))]
+    N
+}
+
+Nconcord_boot <- bplapply(1:Nboot, count_concord, Nguides = Nguides, X = X, Y = Y, BPPARAM = BPPARAM)
+Nconcord_boot <- Nconcord_boot[vapply(Nconcord_boot, is.numeric, FALSE)]
+Nconcord_boot <- simplify2array(Nconcord_boot)
+```
+
+```{r figure_7c}
+Nobs <- top_hits[adj.P.Val < .05 & coef != 0, length(unique(Target))]
+Nconcord <- data.table(x = 0:(1+max(c(Nobs, Nconcord_boot))), N = 0L)
+Nconcord_boot <- data.table(x = Nconcord_boot)[, .N, x]
+Nconcord[Nconcord_boot, N := i.N, on = "x"]
+Nconcord[, Freq := N / sum(N)]
+Nconcord[, Prob := cumsum(Freq)]
+
+pval <- Nconcord[Nobs, 1-Prob]
+ggplot(Nconcord, aes(x, Freq)) +
+    geom_col(color = "black", fill = "gray85") +
+    annotate(geom = "segment", color = "2", linewidth = 1.5,
+             x = Nobs, xend = Nobs, y = pval + .05, yend = pval + .01, arrow = arrow()) +
+    scale_y_continuous(expand = expansion(mult = c(0.01, .05))) +
+    labs(x = "Number of CREs detected", y = "Probability",
+         title = "Histogram of Bootstrap Distribution",
+         subtitle = sprintf("%d Samples", sum(Nconcord$N))) +
+    theme_classic(base_size = 14) +
+    theme(plot.title = element_text(hjust = .5),
+          plot.subtitle = element_text(hjust = .5))
+```
+
+```{r figure_7d}
+ix <- rowSums(X[,grep("chr15-59981721-59981795", colnames(X)), drop = F] > 0) > 0
+DT <- data.table(Targeted = ix,
+                 GCNT3 = Y["GCNT3", ], ANXA2 = Y["ANXA2", ])
+DT <- melt(DT, measure.vars = c("GCNT3", "ANXA2"), variable.name = "Gene", value.name = "Expression")
+DT[, Meth := factor(fifelse(Targeted, "Targeted", "Untargeted"), c("Untargeted", "Targeted"))]
+ggplot(DT, aes(Meth, Expression)) +
+    geom_violin(aes(fill = Meth), show.legend = FALSE) +
+    geom_boxplot(notch = F, width = .1, outlier.color = NA) +
+    geom_signif(comparisons = list(c("Untargeted", "Targeted")),
+                          test = "t.test",
+                          textsize = 6,
+                          map_signif_level = TRUE) +
+    facet_wrap(~Gene, scales = "free_y") +
+    scale_y_continuous(expand = expansion(c(0.1, .15))) +
+    scale_fill_manual(values = c("Targeted" = "#ff7f00", "Untargeted" = "#0000cd")) +
+    labs(x = "", y = "Expression", title = "Perturb-seq Effect", subtitle = "Log-Normalized Counts") +
+    theme_bw(base_size = 14) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank(),
+          plot.title = element_text(hjust = .5),
+          plot.subtitle = element_text(hjust = .5))
+```
+
+## Figure S10
+
+```{r}
+Xagg <- (assay(crispr, "detected") > 1)
+Xagg <- t(Xagg)
+Xagg <- as(Xagg, "lgCMatrix")
+ix <- forcats::fct_inorder(sub("(_CRi)?_B?\\d+$", "", colnames(Xagg)))
+ix <- sparse.model.matrix(~ 0 + ix)
+colnames(ix) <- sub("^ix", "", colnames(ix))
+Xagg <- Xagg %*% ix
+Xagg@x <- rep(1, nnzero(Xagg))
+```
+
+```{r, fig.height=15, fig.width=12}
+tmp <- unique(top_hits[adj.P.Val < .05 & coef != 0 & abs(logFC) > .075, .(Gene, Target)])
+X2 <- as.matrix(Xagg[, tmp$Target])
+Y2 <- as.matrix(Y[tmp$Gene,]) |> t()
+tmp <- tmp[rep(1:nrow(tmp), each = nrow(Y2))]
+tmp[, `:=`(Meth = fifelse(as.vector(X2) > 0, "Targeted", "Untargeted"), Expression = as.vector(Y2))]
+tmp[, Meth := factor(Meth, c("Untargeted", "Targeted"))]
+rm(Y2, X2)
+ggplot(tmp, aes(Meth, Expression)) +
+    geom_violin(aes(fill = Meth), show.legend = FALSE) +
+    geom_boxplot(notch = F, width = .1, outlier.color = NA) +
+    geom_signif(comparisons = list(c("Untargeted", "Targeted")),
+                          test = "t.test",
+                          textsize = 6,
+                          map_signif_level = TRUE) +
+    facet_wrap(~ Gene + Target, scales = "free_y") +
+    scale_y_continuous(expand = expansion(c(0.1, .15))) +
+    scale_fill_manual(values = c("Targeted" = "#ff7f00", "Untargeted" = "#0000cd")) +
+    labs(x = "", y = "Expression", title = "Perturb-seq Effect", subtitle = "Log-Normalized Counts") +
+    theme_bw(base_size = 14) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank(),
+          plot.title = element_text(hjust = .5),
+          plot.subtitle = element_text(hjust = .5))
+```
+

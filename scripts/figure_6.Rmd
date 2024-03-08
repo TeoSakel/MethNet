@@ -1,0 +1,185 @@
+---
+title: "Capture HiC Analysis"
+output: html_document
+params:
+  rmd: figure_6.Rmd
+---
+
+```{r libraries, message=FALSE}
+library(data.table)
+library(UpSetR)
+library(InteractionSet)
+library(ggplot2)
+
+theme_set(theme_classic(18))
+```
+
+```{r parse_params}
+score_thres <- snakemake@params[["min_score"]]
+cluster_scheme <- snakemake@params[["cluster_scheme"]]
+```
+
+```{r read_data,}
+# Annotation
+genes <- fread(snakemake@input[["genes"]])
+genes <- makeGRangesFromDataFrame(genes, keep.extra.columns = TRUE)
+genes <- promoters(genes)
+names(genes) <- genes$id
+mcols(genes) <- NULL
+
+clusters <- fread(snakemake@input[["clusters"]], select = c("probe", cluster_scheme))
+clusters <- unique(clusters[[cluster_scheme]])
+clusters <- GRanges(clusters)
+names(clusters) <- as.character(clusters)
+
+# Experimental Data
+QC <- fread(snakemake@input[["QC"]])
+loops <- fread(snakemake@input[["loops"]])
+
+# MethNet
+associations <- fread(snakemake@input[["associations"]],
+                      select = c("gene", "cluster", "overlap", "dist", "coef", "score"))
+```
+
+## Figure S6
+
+```{r figure_S6a, fig.height=5, fig.width=9}
+QC[, `:=`(File = NULL, sample_id = sub("Rep", "", sample_id))]
+DT <- QC[, .(sample_id, Valid_Pairs, Same_Circularised, Same_Dangling_Ends,
+             Same_Fragment_Internal, Re_Ligation, Contiguous_Sequence, Wrong_Size)]
+DT <- melt(DT, id.vars = 1)
+DT[, variable := gsub("_", " ", variable)]
+lvl <- DT[, sum(value),  variable][order(V1), as.character(variable)]
+DT[, variable := forcats::fct_relevel(variable, lvl)]
+DT[, Ratio := value / sum(value), sample_id]
+ggplot(DT, aes(Ratio, sample_id)) +
+    geom_col(aes(fill = variable)) +
+    scale_fill_manual(values = c("Valid Pairs" = "steelblue",
+                                 setNames(pals::brewer.set2(6), lvl[1:6]))) +
+    scale_x_continuous(labels = scales::percent_format()) +
+    labs(y = "", x = "Read Pairs (M)", fill = "Criteria", title = "HiCUP Filters")
+```
+
+```{r figure_S6b, fig.width=9, fig.height=5}
+DT <- QC[, .(sample_id,
+             Cis_Close = Deduplication_Cis_Close_Uniques,
+             Cis_Far = Deduplication_Cis_Far_Uniques,
+             Trans = Deduplication_Trans_Uniques) ] |> melt(id.vars = "sample_id")
+DT[, variable := factor(variable, c("Cis_Close", "Cis_Far", "Trans"), c("Cis (<15kb)", "Cis (>15kb)", "Trans"))]
+ggplot(DT, aes(value * 1e-6, sample_id)) +
+    geom_col(aes(fill = variable), color = "black", position = "dodge") +
+    scale_fill_brewer(palette = "Reds") +
+    scale_x_continuous(expand = expansion(c(0, .1))) +
+    labs(y = "", x = "Pairs (M)", fill = "")
+```
+
+## Process
+
+```{r}
+loops <- loops[baitChr == oeChr & abs(dist) <= 1e6]
+anc <- rbind(loops[, .(baitChr, baitStart, baitEnd, baitID, baitName)],
+             loops[, .(oeChr, oeStart, oeEnd, oeID, oeName)], use.names = FALSE) |> unique()
+anc <- anc[order(baitID)]
+anc[, `:=`(is_bait = baitName != ".", baitName = NULL)]
+anc <- makeGRangesFromDataFrame(anc, seqnames.field = "baitChr",
+                                start.field = "baitStart", end.field = "baitEnd",
+                                keep.extra.columns = T)
+```
+
+```{r}
+hits <- findOverlaps(genes, anc)
+DT <- pintersect(genes[from(hits)], anc[to(hits)]) |> as.data.table()
+DT <- cbind(DT, as.data.table(hits))
+DT <- DT[, subjectHits[which.max(width)], queryHits]
+genes$anchor <- NA
+genes$anchor[DT$queryHits] <- DT$V1
+anc$promoter <- NA
+anc$promoter[DT$V1] <- names(genes)[DT$queryHits]
+```
+
+
+```{r}
+loops[, `:=`(baitName = NULL, oeName = NULL,
+             baitID = match(baitID, anc$baitID),
+             oeID = factor(oeID, anc$baitID),
+             A549 = A549_1 + A549_2,
+             K562 = K562_1 + K562_2)]
+loops[, status := factor(fcase(A549 < score_thres, "K562",
+                               K562 < score_thres, "A549",
+                               default = "Common"),
+                         c("Common", "A549", "K562"))]
+loops <- loops[, GInteractions(baitID, oeID, anc, A549 = A549, K562 = K562, status = status)]
+```
+
+```{r}
+genes$Nloops <- countOverlaps(genes, loops)
+genes$is_bait <- overlapsAny(genes, subset(anc, is_bait))
+```
+
+```{r}
+associations <- associations[abs(dist) > 10000 & !overlap]
+associations[, `:=`(gene_bait = genes[gene]$is_bait,
+                    cluster_bait = countOverlaps(GRanges(cluster), subset(anc, is_bait)) > 0)]
+associations <- associations[gene_bait | cluster_bait]
+associations[, `:=`(score = pmax(0, score), Nloop = 0L, overlap = NULL, dist = NULL)]
+methnet <- associations[, GInteractions(genes[gene], GRanges(cluster))]
+associations$Nloop <- countOverlaps(methnet, loops)
+```
+
+## Figure 6
+
+```{r figure_6b}
+tmp <- associations[gene_bait == TRUE, if (any(Nloop > 0)) .SD else NULL, gene]
+
+tmp2 <- tmp[, .(N = .N, Prob = mean(Nloop)),
+            .(score = cut(score, c(-1:5, Inf), labels = c(paste0("\u2264 ", 0:5), "> 5")))][order(score)]
+tmp2[, se := 1.96 * sqrt(Prob * (1-Prob)/N)]
+ggplot(tmp2, aes(score, Prob)) +
+    geom_col(aes(fill = score), color = "black", show.legend = FALSE) +
+    geom_errorbar(aes(ymin = Prob - se, ymax = Prob + se), width = .5, size = 1) +
+    scale_fill_brewer(palette = "Reds") +
+    scale_y_continuous(expand = expansion(c(0, .1))) +
+    labs(x = "Association Score", y = "Probability of Loop",
+         title = "Chromatin Loop Prediction") +
+    theme(plot.title = element_text(hjust = .5))
+```
+
+```{r figure_6c}
+cluster_score <- associations[, .(score = sum(score),
+                                  Nloop = sum(Nloop),
+                                  is_bait = any(cluster_bait)), cluster]
+
+get_roc <- function(x, DT) {
+    DT = DT[, y := Nloop > x]
+    res = pROC::roc(y ~ score, DT, quiet = TRUE)
+    DT = as.data.table(res[c("sensitivities", "specificities", "thresholds")])
+    DT[, hub := x]
+    DT[, auc := res$auc]
+
+}
+res <- rbindlist(lapply(2^(0:4), get_roc, DT = cluster_score[is_bait == TRUE]))
+auc_label <- res[, scales::percent(auc[1]), hub][, paste(rev(V1), collapse = "\n")]
+ggplot(res[, .SD[c(1, seq(2, .N-1, 1000), .N)], hub], aes(1-specificities, sensitivities, group = hub)) +
+    geom_line(aes(color = factor(hub)), size = 1) +
+    geom_abline(slope = 1, intercept = 0, color = "gray") +
+    annotate(geom = "text", label = auc_label, x = .9, y = .4, size = 5, fontface = "bold") +
+    scale_color_brewer(palette = "Reds") +
+    coord_equal() +
+    labs(x = "1 - Specificity", y = "Sensitivity", color = "Loops >",
+         title = "Chromatin Hub Prediction") +
+    theme(legend.position = "bottom")
+```
+
+## Figure S7
+
+```{r figure_S7}
+res <- rbindlist(lapply(1:4, get_roc, DT = cluster_score[is_bait == FALSE]))
+ggplot(res, aes(1-specificities, sensitivities, group = hub)) + 
+    geom_line(aes(color = factor(hub)), size = 1) +
+    geom_abline(slope = 1, intercept = 0, color = "gray") + 
+    scale_color_brewer(palette = "Reds") + 
+    coord_equal() +
+    labs(x = "1 - Specificity", y = "Sensitivity", color = "Loops >") +
+    theme(legend.position = "bottom")
+```
+

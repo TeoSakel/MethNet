@@ -1,0 +1,14 @@
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - 'r-base>=4.1'
+  - r-data.table
+  - r-docopt
+  - r-future
+  - r-doparallel
+  - 'r-parallelly>=1.34.0' # conflict
+  - r-glmnet
+  - r-glmnetutils
+  - r-plotmo

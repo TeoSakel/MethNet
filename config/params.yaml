@@ -1,0 +1,5 @@
+tcga_cancers: ['blca', 'brca', 'cesc', 'coad', 'esca', 'gbm', 'hnsc', 'kirc', 'kirp', 'laml', 'lgg', 'lihc', 'luad', 'lusc', 'paad', 'pcpg', 'prad', 'read', 'sarc', 'skcm', 'stad', 'tgct', 'thca', 'thym', 'ucec']
+cpg_cluster_cutoff: 200
+linkage: 'complete'  # complete or single
+max_association_distance: '1e6'
+cre_chunks: 16

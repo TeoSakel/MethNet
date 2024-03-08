@@ -1,0 +1,22 @@
+channels:
+  - bioconda
+  - conda-forge
+
+dependencies:
+  - 'r-base>=4.1'
+  - r-tidyverse
+  - r-data.table
+  - r-docopt
+  - r-future
+  - 'r-parallelly>=1.34.0' # conflict
+  - r-matrixstats
+  - 'r-rlang>=1.1.0'  # conflic
+  - bioconductor-annotationhub
+  - bioconductor-bsgenome.hsapiens.ucsc.hg19
+  - bioconductor-ensdb.hsapiens.v75
+  - bioconductor-genomicalignments
+  - bioconductor-genomicranges
+  - bioconductor-illuminahumanmethylation450kanno.ilmn12.hg19
+  - bioconductor-interactionset
+  - bioconductor-org.hs.eg.db
+  - bioconductor-rtracklayer

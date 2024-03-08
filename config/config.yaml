@@ -1,0 +1,20 @@
+# based on: https://raw.githubusercontent.com/jdblischak/smk-simple-slurm/main/simple/config.yaml
+executor: slurm
+default-resources:
+  - nodes=1
+  - cpus_per_task=2
+  - mem_mb=8192
+  - runtime=64
+  - slurm_partition=cpu_short
+restart-times: 3
+max-jobs-per-second: 10
+max-status-checks-per-second: 1
+local-cores: 1
+latency-wait: 60
+jobs: 500
+keep-going: True
+rerun-incomplete: True
+printshellcmds: True
+scheduler: greedy
+use-conda: True
+

@@ -1,0 +1,25 @@
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+
+dependencies:
+  - 'r-base>=4.1'
+  - r-broom
+  - r-data.table
+  - r-docopt
+  - r-ggbeeswarm
+  - r-ggdist
+  - r-ggrastr
+  - r-ggrepel
+  - r-ggridges
+  - r-ggsci
+  - r-ggsignif
+  - r-hmisc
+  - r-future
+  - 'r-parallelly>=1.34.0' # conflict
+  - r-mgcv
+  - r-pals
+  - r-scales
+  - r-tidyverse
+  - 'r-rlang>=1.1.0'  # conflict

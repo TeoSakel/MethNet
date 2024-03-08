@@ -1,0 +1,643 @@
+---
+title: "make_figures"
+author: "Theodore Sakellaropoulos"
+date: "`r Sys.Date()`"
+output: html_document
+params:
+  rmd: figures.Rmd
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r libraries, message=FALSE}
+library(tidyverse)
+library(broom)
+library(ggbeeswarm)
+library(ggdist)
+library(ggrastr)
+library(ggrepel)
+library(ggridges)
+library(ggsci)
+library(ggsignif)
+library(pals)
+library(scales)
+
+Ncores <- future::availableCores()
+theme_set(theme_classic(base_size = 16))
+
+options(readr.num_threads = Ncores)
+options(readr.show_progress = FALSE)
+
+clip_data <- function(x, thres) {
+    if (length(thres) == 1) thres <- c(-thres, thres)
+    x <- pmin(x, thres[2])
+    x <- pmax(x, thres[1])
+    x
+}
+```
+
+## Parse Input
+
+```{r parse_param}
+min_samples <- as.integer(snakemake@params$min_samples)
+```
+
+```{r read_data, message=FALSE}
+net           <- read_delim(snakemake@input$net)
+associations  <- read_delim(snakemake@input$associations)
+methnet       <- read_delim(snakemake@input$methnet)
+cluster_score <- read_delim(snakemake@input$hubs)
+hyper         <- read_delim(snakemake@input$hyper)
+sample_cancer <- read_delim(snakemake@input$samples)
+```
+
+```{r filter_cancers}
+cancer_counts <- sample_cancer %>%
+    count(cancer, name = "Nsamples") %>%
+    filter(Nsamples >= min_samples)
+
+sample_cancer <- semi_join(sample_cancer, cancer_counts, by = "cancer")
+hyper         <- semi_join(hyper,         cancer_counts, by = "cancer")
+associations  <- semi_join(associations,  cancer_counts, by = "cancer")
+```
+
+```{r cluster_annot, message=FALSE}
+meta <- read_delim(snakemake@input$manifest) %>%
+    filter(str_detect(cluster, "chrY", negate = TRUE)) %>%
+    semi_join(net, by = "cluster") %>%
+    rename(DNase = K562_DNase)
+
+meta <- read_delim(snakemake@input$meth_summary) %>%
+    semi_join(cancer_counts, by = "cancer") %>%
+    replace_na(list(beta_sd_normal = 0, Nsamples_normal = 0L)) %>%
+    mutate(beta_sd = beta_sd_tumor * Nsamples_tumor + beta_sd_normal * Nsamples_normal,
+           beta_sd = beta_sd / (Nsamples_normal + Nsamples_tumor)) %>%
+    group_by(cluster_id) %>%
+    summarize(beta_sd = mean(beta_sd)) %>%
+    ungroup() %>%
+    left_join(x = meta, by = c("cluster" = "cluster_id"))
+
+tfbs <- read_delim(snakemake@input$tfbs)
+loops <- read_delim(snakemake@input$loops)
+
+cox_coef <- read_delim(snakemake@input$cox) %>%
+    rename(cluster = CRE)
+```
+
+
+```{r}
+hub_thres <- quantile(cluster_score$score, .975)
+cluster_score <- cluster_score %>% mutate(Hub = score >= hub_thres)
+
+cluster_score %>%
+    filter(score > 0) %>%
+    mutate(Hub = if_else(Hub, "Hub", "CRE")) %>%
+    ggplot(aes(score_rank, score)) +
+    geom_line(aes(color = Hub), linewidth = 1, show.legend = T) +
+    scale_color_manual(values = c("CRE" = "gray30", "Hub" = "red3")) +
+    labs(x = "Rank", y = "Regulatory Potential", color = "")
+```
+
+
+## Figure 2
+
+```{r figure_2a}
+p_degrees <- net %>%
+    mutate(radius = cut(abs(dist_min),
+                        c(0, 1000, 2000, 5000, 1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6),
+                        labels = paste0(c("1k", "2k", "5k", "10k", "20k", "50k",
+                                          "100k", "200k", "500k", "1M"), "bp"),
+                        include.lowest = TRUE)) %>%
+    count(gene, radius) %>%
+    complete(gene, radius, fill = list(n = 0L)) %>%
+    group_by(gene) %>%
+    mutate(N = cumsum(n)) %>%
+    ungroup() %>%
+    ggplot(aes(N + 1, radius)) +
+    geom_density_ridges(fill = "firebrick", alpha = 0.7) +
+    scale_x_log10() +
+    labs(x = "# of CpG clusters", y = "Window Size",
+         title = "Gene Neighborhood Size")
+p_degrees
+```
+
+```{r figure_2b}
+reds11 <- setNames(brewer.reds(11), c(1:10, ">10"))
+p_Ncancer <- methnet %>%
+    mutate(ncancer = nup + ndn,
+           ncancer = factor(pmin(ncancer, 11), 1:11, c(1:10, ">10"))) %>%
+    ggplot(aes(ncancer)) +
+    geom_bar(aes(fill = ncancer), color = "black", show.legend = FALSE) +
+    scale_fill_manual(values = reds11) +
+    scale_y_continuous(expand = expansion(c(0, .1)),
+                       labels = unit_format(unit = "k", scale = 1e-3)) +
+    labs(x = "# Cancers", y = "# Interactions", title = "Cancer Specificity")
+p_Ncancer
+```
+
+```{r figure_2c}
+p_r2 <- hyper %>%
+    group_by(gene) %>%
+    filter(n() == nrow(cancer_counts)) %>%
+    ungroup() %>%
+    group_by(cancer) %>%
+    summarize(R2 = mean(R2)) %>%
+    ungroup() %>%
+    left_join(cancer_counts, by = "cancer") %>%
+    mutate(cancer = toupper(cancer)) %>%
+    ggplot(aes(Nsamples, R2)) +
+    geom_smooth(method = "lm", se = T, formula = y ~ x, color = "firebrick") +
+    geom_point() +
+    geom_text_repel(aes(label = cancer)) +
+    labs(x = "# Samples", y = bquote("Average Variance Explained"~(R^2)))
+p_r2
+```
+
+
+```{r figure_2d, message=FALSE}
+gene_island <- read_delim(snakemake@input$gene_cgi_net) %>%
+    filter(upstream | !overlap) %>%
+    group_by(gene, Relation_to_Island, upstream) %>%
+    mutate(N_Island = rank(abs(dist))) %>%
+    ungroup() %>%
+    mutate(N_Island = if_else(upstream, -N_Island, N_Island)) %>%
+    select(gene, island, Relation_to_Island, N_Island) %>%
+    filter(abs(N_Island) <= 50)
+
+p_dist <- net %>%
+    mutate(upstream = dist_max < 0, dist = if_else(upstream, dist_max, dist_min_tes)) %>%
+    filter(upstream | overlap == 0) %>%
+    inner_join(select(meta, cluster, island = Island), by = "cluster") %>%
+    inner_join(gene_island, by = c("gene", "island")) %>%
+    left_join(select(methnet, gene, cluster, coef), by = c("gene", "cluster")) %>%
+    replace_na(list(coef = 0)) %>%
+    group_by(Relation_to_Island, N_Island) %>%
+    summarize(prob = mean(coef != 0),
+              coef = mean(coef),
+              dist = median(abs(dist))) %>%
+    ungroup() %>%
+    pivot_longer(c("coef", "prob")) %>%
+    mutate(name = factor(name, c("coef", "prob"), c("Coefficient", "Probability"))) %>%
+    ggplot(aes(N_Island, value, group = N_Island > 0)) +
+    geom_vline(xintercept = 0, linetype = "longdash", color = "gray") +
+    geom_point(aes(color = log10(dist)), size = 2) +
+    scale_color_distiller(palette = "Reds", direction = -1,
+                          breaks = c(3, 4, 4.7, 5.699),
+                          labels = function(x) sprintf("%gkb", sign(x) * round(10^abs(x) / 1000))) +
+    facet_grid(name ~ Relation_to_Island, scales = "free_y") +
+    labs(x = "Order away from Gene", y = "", color = "Average\nDistance") +
+    theme_bw(base_size = 14)
+p_dist
+```
+
+```{r figure_2e, fig.width=9, fig.height=6}
+DF <- read_csv(snakemake@input[["examples"]]) %>%
+    mutate(cancer = str_to_upper(cancer),
+           gene = factor(gene, c("IFNG", "GSTT1"), c("IFNγ", "GSTT1")),
+           expr = pmax(expr, 0))
+
+DF %>%
+    sample_frac() %>% # mix points
+    ggplot(aes(beta, expr)) +
+    geom_point_rast(aes(color = cancer), size = .5, raster.dpi = 300) +
+    scale_color_igv(drop = FALSE) +
+    scale_x_continuous(breaks = seq(0, 1, .25)) +
+    facet_wrap(~ gene, scales = "free_y") +
+    labs(x = "Methylation Status", y = "Gene Expression", color = "TCGA Project") +
+    guides(color = guide_legend(override.aes = list(size = 2))) +
+    theme_classic(base_size = 14) +
+    theme(strip.text = element_text(face = "bold"),
+          strip.background = element_rect(color = NA))
+```
+
+```{r figure_2e_boxplot}
+DF %>%
+    group_by(cancer, gene, elem) %>%
+    summarize(rho = cor(expr, beta, method = "spearman")) %>%
+    ungroup() %>%
+    ggplot(aes(gene, rho)) +
+    geom_hline(yintercept = 0, linetype = "dotted") +
+    geom_quasirandom(aes(color = cancer)) +
+    scale_color_igv(drop = FALSE) +
+    labs(x = "Gene", y = "Spearman Correlation", color = "TCGA Project")
+```
+
+## Figure S1
+
+```{r figure_S1a, fig.height=7, fig.width=9}
+Ncre <- n_distinct(net$cluster)
+
+DF_assoc <- associations %>%
+    count(cancer, sort = TRUE, name = "Active") %>%
+    mutate(cancer = toupper(cancer), Fraction = Active/nrow(net))
+
+DF_cre <- associations %>%
+    group_by(cancer) %>%
+    summarize(Active = n_distinct(cluster)) %>%
+    ungroup() %>%
+    arrange(desc(Active)) %>%
+    mutate(Fraction = Active / Ncre, cancer = toupper(cancer)) %>%
+    mutate(cancer = fct_inorder(cancer))
+cancer_lvl <- levels(DF_cre$cancer)
+
+list(CREs = DF_cre, Associations = DF_assoc) %>%
+    bind_rows(.id = "metric") %>%
+    mutate(cancer = factor(cancer, cancer_lvl)) %>%
+    ggplot(aes(Active * .001, cancer)) +
+    geom_col(color = "white", fill = "red2") +
+    scale_x_continuous(expand = expansion(c(0, .1))) +
+    facet_wrap(~metric, nrow = 1, scales = "free_x") +
+    labs(x = "Number of Elements (x1000)", y = "TCGA Study") +
+    theme_bw(base_size = 18)
+```
+
+```{r figure_S1b, fig.width=10, fig.height=8}
+DF <- count(associations, cancer, gene, name = "Active")
+net %>%
+    count(gene, name = "N") %>%
+    left_join(DF, by = "gene") %>%
+    replace_na(list(Active = 0L)) %>%
+    mutate(Fraction = Active / N,
+           cancer = factor(toupper(cancer), cancer_lvl)) %>%
+    filter(!is.na(cancer)) %>%
+    pivot_longer(c("Active", "Fraction")) %>%
+    mutate(name = if_else(name == "Active", "Number of CREs", "Fraction of CREs")) %>%
+    ggplot(aes(value, cancer)) +
+    geom_density_ridges(fill = "red2", alpha = .5) +
+    scale_x_log10() +
+    facet_wrap(~ name, nrow = 1L, scales = "free_x") +
+    labs(x = "", y = "TCGA Study") +
+    theme_bw(base_size = 18)
+```
+
+```{r figure_S1c, fig.width=10, fig.height=8}
+DF <- count(associations, cancer, cluster, name = "Active")
+net %>%
+    count(cluster, name = "N") %>%
+    left_join(DF, by = "cluster") %>%
+    replace_na(list(Active = 0L)) %>%
+    mutate(Fraction = Active / N,
+           cancer = factor(toupper(cancer), cancer_lvl)) %>%
+    filter(!is.na(cancer)) %>%
+    mutate(Active = pmin(Active, 10)) %>%
+    pivot_longer(c("Active", "Fraction")) %>%
+    mutate(name = if_else(name == "Active", "Number of Genes", "Fraction of Genes")) %>%
+    ggplot(aes(value, cancer)) +
+    geom_density_ridges(fill = "red2", alpha = .5) +
+    scale_x_log10() +
+    facet_wrap(~ name, nrow = 1L, scales = "free_x") +
+    labs(x = "", y = "TCGA Study") +
+    theme_bw(base_size = 18)
+```
+
+## Figure 3
+
+```{r figure_3b}
+chromm_colors = c("Promoter" = "red2", "Other Promoter" = "red2",
+                  "Poised_Promoter" = "purple",
+                  "Enhancer" = "orange",
+                  "Weak_Enhancer" = "yellow",
+                  "Insulator" = "skyblue3",
+                  "Txn" = "darkgreen",
+                  "Repressed" = "gray30",
+                  "Mixed" = "bisque1")
+
+p_cre_hmm <- meta %>%
+    mutate(state = factor(state),
+           state = fct_relevel(state, "Low_Signal")) %>%
+    select(cluster, state) %>%
+    inner_join(cluster_score, by = "cluster") %>%
+    lm(score ~ state, data = .) %>%
+    tidy() %>%
+    arrange(estimate) %>%
+    mutate(term = if_else(term == "(Intercept)", "Low_Signal", term),
+           term = str_remove(term, "state"),
+           term = if_else(term == "Promoter", "Other Promoter", term),
+           term = fct_inorder(term)) %>%
+    filter(term != "Low_Signal") %>%
+    ggplot(aes(term, estimate)) +
+    geom_col(aes(fill = term), show.legend = FALSE) +
+    geom_hline(yintercept = 0) +
+    geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error),
+                  width = 0.5, size = 1.) +
+    scale_fill_manual(values = chromm_colors) +
+    labs(x = "", y = "Potential Enrichment",
+         title = "Regulatory Elements", fill = "Labels") +
+    theme_classic(base_size = 24) +
+    coord_flip()
+p_cre_hmm
+```
+
+```{r figure_3c}
+DF_tfbs <- tfbs %>%
+    filter(score == 1000) %>%
+    select(-score) %>% ## avoids conflict
+    left_join(x = cluster_score, by = "cluster") %>%
+    select(cluster, score, name) %>%
+    replace_na(list(name = "None")) %>%
+    group_by(name) %>%
+    filter(n() >= 100) %>%
+    ungroup() %>%
+    select(-cluster) %>%
+    mutate(name = fct_infreq(name),
+           name = fct_relevel(name, "None"),
+           X = 1L) %>%
+    pivot_wider(names_from = "name", values_from = "X", values_fill = 0L) %>%
+    select(-None)
+
+df <- lm(score ~ ., data = DF_tfbs) %>%
+    tidy() %>%
+    filter(term != "(Intercept)") %>%
+    mutate(q.value = p.adjust(p.value, "fdr"))
+
+p_tfbs <- ggplot(df, aes(estimate, pmin(50, -log10(q.value)))) +
+    geom_point(aes(shape = -log10(q.value) > 50), show.legend = FALSE) +
+    geom_text_repel(aes(label = term), color = "red", data = top_n(df, 10, -q.value)) +
+    labs(x = "Potential Enrichment", y = "FDR (-log10)", title = "Regulatory Factors") +
+    theme_classic(base_size = 24) +
+    theme(plot.title = element_text(hjust = .5))
+p_tfbs
+```
+
+```{r figure_3d}
+group_loops <- function(x) {
+    ix <- which(x > 0)
+    x1 <- x[ix]
+    x1 <- Hmisc::cut2(x1, g = 4L)
+    x[ix] <- as.integer(x1)
+    factor(x, 0:nlevels(x1), c("0", levels(x1)))
+}
+
+DF_loops <- loops %>%
+    select(cluster, starts_with("H3K27ac.")) %>%
+    pivot_longer(cols = starts_with("H3K27ac."),
+                 names_to = "cell", values_to = "count") %>%
+    group_by(cluster) %>%
+    summarize(Nloops = sum(count)) %>%
+    ungroup()
+
+DF_loops <- net %>%
+    group_by(cluster) %>%
+    filter(all(dist_max < -2000 | dist_min > 2000)) %>%
+    ungroup() %>%
+    semi_join(x = cluster_score, by = "cluster") %>%
+    left_join(DF_loops, by = "cluster") %>%
+    select(cluster, Hub, score, Nloops) %>%
+    mutate(loop_grp = group_loops(Nloops))
+
+p_loops <- DF_loops %>%
+    lm(score ~ loop_grp, data = .)  %>%
+    tidy() %>%
+    mutate(term = sub("loop_grp", "", term),
+           term = if_else(term == "(Intercept)", "0", term),
+           term = fct_inorder(term),
+           std.error = 1.96 * std.error) %>%
+    ggplot(aes(term, estimate)) +
+    geom_hline(yintercept = 0) +
+    geom_col(aes(fill = term), color = "black", show.legend = F) +
+    geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error),
+                  width = 0.5, size = 1.) +
+    scale_fill_brewer(palette = "Reds") +
+    scale_y_continuous(expand = expansion(c(0, .1))) +
+    labs(y = "Potential Enrichment", x = "H3K27ac Loops", title = "Chromatin Contacts") +
+    theme_classic(base_size = 24) +
+    theme(plot.title = element_text(hjust = .5))
+p_loops
+```
+
+## Figure 4
+
+```{r figure_4a}
+meta %>%
+    select(cluster, beta_sd) %>%
+    inner_join(cluster_score, by = "cluster") %>%
+    ggplot(aes(score, beta_sd)) +
+    annotate(geom = "rect", xmin = hub_thres, xmax = Inf, ymin = -Inf, ymax = Inf,
+             color = NA, fill = 2, alpha = .25) +
+    geom_point(size = .1, alpha = .5) +
+    geom_density_2d(n = 200) +
+    geom_vline(xintercept = hub_thres, color = "red3") +
+    annotate(geom = "text", y = .3, x = 500, label = "Hub Region",
+             size = 7, fontface = "bold", color = 2) +
+    labs(x = "Regulatory Potential", y = "Methylation Variance (σ)") +
+    theme_classic(base_size = 16)
+```
+
+```{r figure_4b}
+cluster_score %>%
+    mutate(Hub = if_else(Hub, "Hub", "CRE")) %>%
+    ggplot(aes(Hub, ninter)) +
+    geom_violin(aes(fill = Hub), show.legend = FALSE) +
+    geom_boxplot(notch = TRUE, width = .125, outlier.color = NA) +
+    scale_fill_manual(values = c("Hub" = "red3", "CRE" = "gray")) +
+    labs(x = "Regulatory Element", y = "Number of MethNet Associations",
+         title = "Gene Associations per Regulatory Element") +
+    theme_classic(base_size = 16)
+```
+
+```{r figure_4c}
+meta %>%
+    select(cluster, beta_sd) %>%
+    filter(beta_sd >= quantile(beta_sd, .25, na.rm = T)) %>%
+    inner_join(cluster_score, by = "cluster") %>%
+    select(cluster, Hub) %>%
+    inner_join(cox_coef, by = "cluster") %>%
+    filter(term == "CpG") %>%
+    mutate(Hub = if_else(Hub, "Hub", "CRE"),
+           estimate2 = clip_data(log10(abs(estimate)), c(-1, 1.5))) %>%
+    ggplot(aes(Hub, 10^estimate2)) +
+    geom_violin(aes(fill = Hub), show.legend = FALSE) +
+    geom_boxplot(width = .125, notch = T, outlier.color = NA) +
+    geom_signif(comparisons = list(c("CRE", "Hub")), map_signif_level = TRUE) +
+    scale_y_log10() +
+    scale_fill_manual(values = c("CRE" = "gray", "Hub" = "red3")) +
+    labs(x = "", y = "Effect Size", title = "Element-wise Cox-PH Survival Analysis") +
+    theme_classic(base_size = 16)
+```
+
+```{r figure_4d}
+p_chromhmm_hubs <- cluster_score %>%
+    filter(score > 0) %>%
+    inner_join(meta, by = "cluster") %>%
+    select(cluster, Hub, state) %>%
+    mutate(state = factor(state),
+           state = fct_relevel(state, "Low_Signal")) %>%
+    glm(Hub ~ state, family = binomial(), data = .) %>%
+    tidy() |>
+    arrange(estimate) %>%
+    # filter(term != "stateTSS") %>%
+    mutate(term = if_else(term == "(Intercept)", "Low_Signal", term),
+           term = str_remove(term, "state"),
+           term = if_else(term == "Promoter", "Other Promoter", term),
+           term = fct_inorder(term),
+           std.error = std.error * 1.96) %>%
+    filter(term != "Low_Signal") %>%
+    ggplot(aes(term, estimate)) +
+    geom_col(aes(fill = term), show.legend = FALSE) +
+    geom_hline(yintercept = 0) +
+    geom_errorbar(aes(ymin = estimate - std.error,
+                      ymax = estimate + std.error),
+                  width = 0.5, size = 1.) +
+    scale_fill_manual(values = chromm_colors) +
+    labs(x = "", y = "Hub Enrichment", title = "", fill = "Labels") +
+    theme_classic(base_size = 24) +
+    coord_flip()
+p_chromhmm_hubs
+```
+
+```{r figure_4e}
+df1 <- glm(I(score > hub_thres) ~ .,
+           data = filter(DF_tfbs, score > 0),
+           family = binomial()) %>%
+    tidy() %>%
+    filter(term != "(Intercept)") %>%
+    mutate(q.value = p.adjust(p.value, "fdr")) %>%
+    arrange(q.value)
+
+p_tfbs_hub <- df1 %>%
+    filter(abs(estimate) < 1.5) %>%
+    ggplot(aes(estimate, pmin(15, -log10(q.value)))) +
+    geom_point(aes(shape = -log10(q.value) > 15), show.legend = FALSE) +
+    geom_text_repel(aes(label = term), color = "red", data = top_n(df1, 10, -q.value)) +
+    labs(x = "Hub Enrichment", y = "FDR (-log10)", title = "") +
+    theme_classic(base_size = 24) +
+    theme(plot.title = element_text(hjust = .5))
+p_tfbs_hub
+```
+
+```{r figure_4f}
+p_loops_hubs <- DF_loops %>%
+    filter(score > 0) %>%
+    glm(Hub ~ loop_grp, data = ., family = binomial()) %>%
+    tidy() %>%
+    mutate(term = sub("loop_grp", "", term),
+           term = if_else(term == "(Intercept)", "0", term),
+           term = fct_inorder(term),
+           std.error = 1.96 * std.error) %>%
+    ggplot(aes(term, estimate)) +
+    geom_hline(yintercept = 0) +
+    geom_col(aes(fill = term), color = "black", show.legend = F) +
+    geom_errorbar(aes(ymin = estimate - std.error, ymax = estimate + std.error),
+                  width = 0.5, size = 1.) +
+    scale_fill_brewer(palette = "Reds") +
+    scale_y_continuous(expand = expansion(c(0, .1))) +
+    labs(y = "Hub Enrichment", x = "H3K27ac Loops", title = "") +
+    theme_classic(base_size = 24) +
+    theme(plot.title = element_text(hjust = .5))
+p_loops_hubs
+```
+
+## Figure S4
+
+```{r figure_S4a}
+associations %>%
+    count(cluster, cancer) %>%
+    complete(cluster, cancer, fill = list(n = 0L)) %>%
+    group_by(cluster) %>%
+    summarize(Rate = mean(n)) %>%
+    ungroup() %>%
+    inner_join(select(cluster_score, cluster, Hub), by = "cluster") %>%
+    mutate(Hub = if_else(Hub, "Hub", "CRE")) %>%
+    inner_join(count(net, cluster, name = "neighbors"), by = "cluster") %>%
+    filter(neighbors > 10) %>%
+    ggplot(aes(Hub, Rate)) +
+    stat_halfeye(aes(fill = Hub), show.legend = FALSE, width = .3, .width = c(0.5, .9)) +
+    geom_signif(comparisons = list(c("Hub", "CRE")), map_signif_level = TRUE) +
+    scale_fill_manual(values = c(Hub = "red3", CRE = "gray")) +
+    labs(x = "", y = "Association rate per cancer") +
+    coord_flip()
+```
+
+```{r figure_S4b}
+cluster_score %>%
+    select(cluster, Hub) %>%
+    mutate(Hub = if_else(Hub, "Hub", "CRE")) %>%
+    inner_join(methnet, by = "cluster") %>%
+    filter(intergenic == TRUE) %>%
+    count(Hub, Specificity = pmin(nup + ndn, 20), name = "frac") %>%
+    group_by(Hub) %>%
+    mutate(frac = frac / sum(frac)) %>%
+    ungroup() %>%
+    pivot_wider(names_from = "Hub", values_from = "frac") %>%
+    mutate(Delta = log2(Hub) - log2(CRE),
+           Bias = if_else(Delta > 0, "Hub", "CRE")) %>%
+    ggplot(aes(Specificity, Delta)) +
+    geom_col(aes(fill = Bias)) +
+    scale_fill_manual(values = c(Hub = "red3", CRE = "gray")) +
+    labs(x = "Cancer Frequency", y = "Association Frequency Bias") +
+    coord_flip()
+```
+
+```{r figure_S4c_S4d}
+DF <- meta %>%
+    select(cluster, DNase) %>%
+    inner_join(cluster_score, by = "cluster") %>%
+    select(cluster, Hub, score, DNase) %>%
+    mutate(Chromatin = factor(if_else(DNase > 0, "Open", "Closed")))
+
+glm(I(Chromatin == "Open") ~ 0 + Hub, data = DF, family = binomial()) %>%
+    tidy() %>%
+    mutate(term = if_else(term == "HubTRUE", "Hub", "CRE"),
+           ymin = exp(estimate - 1.96*std.error),
+           ymax = exp(estimate + 1.96*std.error),
+           estimate = exp(estimate)) %>%
+    ggplot(aes(term, estimate)) +
+    geom_col(aes(fill = term), color = "black", show.legend = FALSE) +
+    geom_hline(yintercept = 0) +
+    geom_errorbar(aes(ymin = ymin, ymax = ymax), size = 1, width = .5) +
+    scale_fill_manual(values = c("CRE" = "gray", "Hub" = "red3")) +
+    scale_y_continuous(labels = percent_format()) +
+    labs(x = "Element Status", y = "DHS Ratio",
+         title = "Hub DNase Enrichment", subtitle = "K562 DNase NarrowPeaks")
+
+glm(Hub ~ 0 + Chromatin, data = DF, family = binomial()) %>%
+    tidy() %>%
+    mutate(term = if_else(term == "ChromatinOpen", "Open", "Closed"),
+           ymin = exp(estimate - 1.96*std.error),
+           ymax = exp(estimate + 1.96*std.error),
+           estimate = exp(estimate)) %>%
+    ggplot(aes(term, estimate)) +
+    geom_col(aes(fill = term), color = "black", show.legend = FALSE) +
+    geom_hline(yintercept = 0) +
+    geom_errorbar(aes(ymin = ymin, ymax = ymax), size = 1, width = .5) +
+    scale_fill_manual(values = c("Open" = "#DE2D26", "Closed" = "#FCAE91")) +
+    scale_y_continuous(labels = percent_format()) +
+    labs(x = "Chromatin Status Status", y = "DHS Ratio",
+         title = "Hub DNase Enrichment", subtitle = "K562 DNase NarrowPeaks")
+```
+
+## Figure S5
+
+```{r figure_S5, fig.width=7, fig.height=7}
+DF <- meta %>%
+    select(cluster, beta_sd) %>%
+    filter(beta_sd >= quantile(beta_sd, .25, na.rm = T)) %>%
+    inner_join(cluster_score, by = "cluster") %>%
+    select(cluster, Hub) %>%
+    mutate(Hub = if_else(Hub, "Hub", "CRE"))
+cox_coef %>%
+    group_by(cluster) %>%
+    mutate(marginal = estimate + estimate[1]) %>%
+    ungroup() %>%
+    mutate(term = str_remove(term, fixed("CpG:strata(cancer)"))) %>%
+    filter(term %in% c("GBM", "LGG", "BRCA", "KIRC")) %>%
+    inner_join(DF, by = "cluster") %>%
+    mutate(fdr = -log10(p.adjust(p.value, "BH")),
+           fdr = if_else(term == "LGG", pmin(fdr, 6), pmin(fdr, 2)),
+           term = factor(term, c("LGG", "GBM", "BRCA", "KIRC"),
+                         c("Lower Grade Glioma", "Glioblastoma", "Breast Cancer", "Renal Cell Carcinoma")),
+           marginal2 = clip_data(log10(abs(marginal)), c(-1, 1.5))) %>%
+    ggplot(aes(Hub, 10^marginal2)) +
+    geom_violin(aes(fill = Hub), size = .2, show.legend = FALSE) +
+    geom_boxplot(notch = T, width = .125, outlier.color = NA) +
+    geom_signif(comparisons = list(c("CRE", "Hub")),
+                          map_signif_level = TRUE) +
+    # scale_color_manual(values = c("CRE" = "gray", "Hub" = "red3")) +
+    scale_fill_manual(values = c("CRE" = "gray", "Hub" = "red3")) +
+    scale_y_log10(expand = expansion(c(0.1, .15))) +
+    facet_wrap(~ term, nrow = 2L, ncol = 2L) +
+    labs(x = "", y = "Effect Size", title = "Cox-PH Survival Analysis - Cancer Specific Effect") +
+    theme_bw(base_size = 16)
+```
