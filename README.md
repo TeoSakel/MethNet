@@ -69,4 +69,9 @@ The pipeline was developed using:
   + `cre_cox_params.csv`: coefficients of Cox-PH models fitted for each intergenic CpG cluster
   + `interaction_examples.csv`: methylation and gene expression data to generate figure S2 and S3
   + `perturb-seq_results.csv`: interactions experimentally recovered from the perturb-seq assay
-- `xenahubs`: xenahub clones for GDC and PanCancerAtlas hubs.
+- `xenahubs/`: xenahub clones for GDC (`gdc/`) and PanCancerAtlas (`pancanatlas/`) hubs.
+  `scripts/download_xenahubs.sh` will clone both hubs but the pipeline only requires the following files:
+  + `gdc/genomicMatrix/TCGA-{cancer}/Xena_Matrices/TCGA-{cancer}.methylation450.tsv` (where `{cancer}` is a wildcard for all the TCGA projects required)
+  + `pancanatlas/genomicMatrix/EB++AdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.xena.tsv`
+  + `pancanatlas/clinicalMatrix/Survival_SupplementalTable_S1_20171025_xena_sp.tsv`
+  + `pancanatlas/probeMap/hugo_gencode_good_hg19_V24lift37_probemap.tsv hugo_hg19_pancan.tsv`
