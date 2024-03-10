@@ -8,7 +8,8 @@ CLUSTER_SCHEME='{}_{}bp'.format(LINKAGE, CUTOFF)
 CRE_CHUNKS=config['cre_chunks']
 
 localrules: gene_annot, probe_annot, combine_results, download_clinical,
-            split_intergenic_cre, combine_survival, get_intergenic_cre
+            split_intergenic_cre, combine_survival, get_intergenic_cre,
+            download_perturb_seq_results, download_protospacer_umi_thresholds
 
 rule all:
     input:
@@ -414,6 +415,18 @@ rule figure_6:
         cpus_per_task=4
     script:
         "scripts/figure_6.Rmd"
+
+rule download_perturb_seq_results:
+    output:
+        "data/experiments/perturb_seq_results.h5"
+    shell:
+        "wget 'https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE236304&format=file&file=GSE236304%5Ffiltered%5Ffeature%5Fbc%5Fmatrix%2Eh5' -O {output}"
+
+rule download_protospacer_umi_thresholds:
+    output:
+        "data/experiments/protospacer_umi_thresholds.csv"
+    shell:
+        "wget 'https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE236304&format=file&file=GSE236304%5Fprotospacer%5Fumi%5Fthresholds%2Ecsv%2Egz' -O {output}"
 
 rule figure_7:
     input:
