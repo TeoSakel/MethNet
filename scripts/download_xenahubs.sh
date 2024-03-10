@@ -4,20 +4,24 @@ set -e
 
 CANCERS=( "acc" "blca" "brca" "cesc" "chol" "coad" "dlbc" "esca" "gbm" \
           "hnsc" "kich" "kirc" "kirp" "laml" "lgg" "lihc" "luad" "lusc" \
-          "meso" "ov" "paad" "pancan" "pcpg" "prad" "read" "sarc" "skcm" \
-          "stad" "tgct" "thca" "thym" "ucec" "ucs" "uvm" )
+          "meso" "ov" "paad" "pcpg" "prad" "read" "sarc" "skcm" "stad" \
+          "tgct" "thca" "thym" "ucec" "ucs" "uvm" )
 
 DATA="$1"
 OUTDIR="$2"
 mkdir -p "$OUTDIR"
+mkdir -p data/xenahubs
 
 if [[ "$DATA" == meth ]]; then
-    ./scripts/clone_xena.py gdc -o data/xenahubs
     gdc="$(realpath data/xenahubs/gdc/genomicMatrix)"
     for cancer in "${CANCERS[@]}" ; do
         CANCER="${cancer^^}"
         mat="$gdc"/TCGA-"$CANCER"/Xena_Matrices/TCGA-"$CANCER".methylation450.tsv
-        [[ -f "$mat" ]] && ln -s "$mat" "$OUTDIR"/"$cancer".tsv
+        if [[ ! -f "$mat" ]]; then
+            echo Downloading Xenahubs GDC Cohort because "${CANCER}" is missing
+            ./scripts/clone_xena.py gdc -o data/xenahubs
+        fi
+        ln -s "$mat" "$OUTDIR"/"$cancer".tsv
     done
 elif [[ "$DATA" == rna ]]; then
     pancan="$(realpath data/xenahubs/pancanatlas)"

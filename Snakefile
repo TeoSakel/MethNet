@@ -145,7 +145,7 @@ rule download_meth:
     resources:
         runtime=60*24*2
     shell:
-        "./scripts/download_xenahubs.sh met data/matrices/methyl450k"
+        "./scripts/download_xenahubs.sh meth data/matrices/methyl450k"
 
 rule download_rna:
     output:
