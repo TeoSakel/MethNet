@@ -16,6 +16,9 @@ To run the code you need to:
 This command should generate 3 html files under `./data/figures/` with all the
 programmatically generated figures of the article.
 
+The expected running times and other resources for each `rule` is specified in the `resources` field 
+and refer to the whole pipeline (all 24 TCGA studies). For testing/development users can specify fewer studies.
+
 ## Reproducibility notes
 
 The pipeline was developed using:
